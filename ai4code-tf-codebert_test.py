@@ -22,9 +22,9 @@ pd.set_option('expand_frame_repr', False);
 DATA_PATH = "data"
 BASE_MODEL = "huggingface_local/codebert-base" #"microsoft/codebert-base"
 N_SPLITS = 5
-SEQ_LEN = 128
+SEQ_LEN = 256
 RANDOM_STATE = 42
-NO_EPOCHS = 20
+NO_EPOCHS = 100
 
 try:
     TPU = tf.distribute.cluster_resolver.TPUClusterResolver()
@@ -37,7 +37,7 @@ except Exception:
     #STRATEGY = tf.distribute.get_strategy()
     gpus = tf.config.list_logical_devices('GPU')
     strategy = tf.distribute.MirroredStrategy(gpus)
-    BATCH_SIZE = 128
+    BATCH_SIZE = 64
     NB_LIMIT = 10000
 
 print("TensorFlow", tf.__version__)
@@ -214,111 +214,41 @@ def get_model() -> tf.keras.Model:
     )
     return model
 ###################################### CELL #####################################################################################
+from bisect import bisect
 
-paths = glob.glob(os.path.join(DATA_PATH, "train", "*.json"))
-if NB_LIMIT is not None:
-    paths = paths[:NB_LIMIT]
-
-notebooks_train = [ read_notebook(path) for path in tqdm(paths, desc='Train NBs')]
-
-df =  pd.concat(notebooks_train).set_index('id', append=True).swaplevel().sort_index(level='id', sort_remaining=False)
-
-df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
-
-df_orders_ = df_orders.to_frame().join(   df.reset_index('cell_id').groupby('id')['cell_id'].apply(list),
-    how='right',
-)
-
-ranks = {}
-for id_, cell_order, cell_id in df_orders_.itertuples():
-    ranks[id_] = {'cell_id': cell_id, 'rank': get_ranks(cell_order, cell_id)}
-
-df_ranks = (
-    pd.DataFrame
-    .from_dict(ranks, orient='index')
-    .rename_axis('id')
-    .apply(pd.Series.explode)
-    .set_index('cell_id', append=True)
-)
-
-df_ancestors = pd.read_csv(
-    os.path.join(DATA_PATH, "train_ancestors.csv"),
-    usecols=["id", "ancestor_id"],
-    index_col="id",
-)
-
-df = df.reset_index().merge(df_ranks, on=["id", "cell_id"]).merge(df_ancestors, on=["id"])
-#df = df.dropna()
-display(df)
-
-dict_cellid_source = dict(zip(df['cell_id'].values, df['source'].values))
-
-##################################### CELL ##############################################################################
-input_ids, attention_mask, segment_ids, labels = tokenize_and_label(df, dict_cellid_source)
-
-#groups = df["ancestor_id"].to_numpy()
-
-print("input_ids:", input_ids.shape)
-print("attention_mask:", attention_mask.shape)
-print("segment_ids:", attention_mask.shape)
-print("labels:", labels.shape)
+def count_inversions(a):
+    inversions = 0
+    sorted_so_far = []
+    for i, u in enumerate(a):
+        j = bisect(sorted_so_far, u)
+        inversions += i - j
+        sorted_so_far.insert(j, u)
+    return inversions
 
 
-#################################### train ############################################################################
-input_ids, attention_mask, segment_ids, labels= shuffle(
-    input_ids, attention_mask, segment_ids, labels, random_state=RANDOM_STATE
-)
-kfold = KFold(n_splits=N_SPLITS)
-
-for i, (train_index, val_index) in enumerate(kfold.split(input_ids, labels)):
-    if TPU is not None:
-        tf.tpu.experimental.initialize_tpu_system(TPU)
-
-    with strategy.scope():
-        model = get_model()
-        model.summary()
-
-        train_dataset = get_dataset(
-            input_ids=input_ids[train_index],
-            attention_mask=attention_mask[train_index],
-            segment_ids= segment_ids[train_index],
-            labels=labels[train_index],
-            repeated=False,
-        )
-        val_dataset = get_dataset(
-            input_ids=input_ids[val_index],
-            attention_mask=attention_mask[val_index],
-            segment_ids=segment_ids[val_index],
-            labels=labels[val_index],
-            ordered=False,
-        )
-
-        model.fit(
-            train_dataset,
-            validation_data=val_dataset,
-            batch_size = BATCH_SIZE,
-            epochs=NO_EPOCHS,
-            verbose=1,
-        )
-
-    model.save_weights(f"model_{i}.h5")
-    break
+def kendall_tau(ground_truth, predictions):
+    total_inversions = 0
+    total_2max = 0  # twice the maximum possible inversions across all instances
+    for gt, pred in zip(ground_truth, predictions):
+        ranks = [gt.index(x) for x in pred]  # rank predicted order in terms of ground truth
+        total_inversions += count_inversions(ranks)
+        n = len(gt)
+        total_2max += n * (n - 1)
+    return 1 - 4 * total_inversions / total_2max
 
 
-
-exit()
 #################################### CELL inference ######################################################################
 paths = glob.glob(os.path.join(DATA_PATH, "test", "*.json"))
 
-df = pd.concat([read_notebook(x) for x in tqdm(paths, total=len(paths))])
-df = df.rename_axis("cell_id").reset_index()
+test_df = pd.concat([read_notebook(x) for x in tqdm(paths, total=len(paths))])
+test_df = test_df.rename_axis("cell_id").reset_index()
 
-df["rank"] = df.groupby(["id", "cell_type"]).cumcount()
-df["pct_rank"] = df.groupby(["id", "cell_type"])["rank"].rank(pct=True)
+test_df["rank"] = test_df.groupby(["id", "cell_type"]).cumcount()
+test_df["pct_rank"] = test_df.groupby(["id", "cell_type"])["rank"].rank(pct=True)
 
-display(df)
+display(test_df)
 
-input_ids, attention_mask, segment_ids, labels = tokenize_and_label(df, dict(zip(df['cell_id'].values, df['source'].values)))
+input_ids, attention_mask, segment_ids, labels = tokenize_and_label(test_df, dict(zip(test_df['cell_id'].values, test_df['source'].values)))
 test_dataset = get_dataset(
     input_ids=input_ids,
     attention_mask=attention_mask,
@@ -329,9 +259,40 @@ model = get_model()
 model.load_weights("model_0.h5")
 y_pred = model.predict(test_dataset)
 
+preds_copy = y_pred
+
+pred_vals = []
+count = 0
+for id, df_tmp in tqdm(test_df.groupby('id')):
+  df_tmp_mark = df_tmp[df_tmp['cell_type']=='markdown']
+  df_tmp_code = df_tmp[df_tmp['cell_type']!='markdown']
+  df_tmp_code_rank = df_tmp_code['rank'].rank().values
+  N_code = len(df_tmp_code_rank)
+  N_mark = len(df_tmp_mark)
+
+  preds_tmp = preds_copy[count:count+N_mark * N_code]
+
+  count += N_mark * N_code
+    # for each markdown cell,
+  for i in range(N_mark):
+    pred = preds_tmp[i*N_code:i*N_code+N_code]
+
+    softmax = np.exp((pred-np.mean(pred)) *20)/np.sum(np.exp((pred-np.mean(pred)) *20))
+
+    rank = np.sum(softmax * df_tmp_code_rank)
+    pred_vals.append(rank)
+
+######################################### calculate Kendal_tau ##########################################################
+test_df.loc[test_df["cell_type"] == "markdown", "pred"] = pred_vals
+
+df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
+
+y_dummy = test_df.sort_values("pred").groupby('id')['cell_id'].apply(list)
+kendall_tau(df_orders.loc[y_dummy.index], y_dummy)
+
 ################################### SUBMIT CELL ###########################################################################
-df.loc[df["cell_type"] == "markdown", "pct_rank"] = y_pred
-df = df.sort_values("pct_rank").groupby("id", as_index=False)["cell_id"].apply(lambda x: " ".join(x))
+test_df.loc[test_df["cell_type"] == "markdown", "pct_rank"] = y_pred
+df = test_df.sort_values("pct_rank").groupby("id", as_index=False)["cell_id"].apply(lambda x: " ".join(x))
 df.rename(columns={"cell_id": "cell_order"}, inplace=True)
 df.to_csv("submission.csv", index=False)
 display(df)
