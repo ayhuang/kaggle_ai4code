@@ -20,32 +20,12 @@ pd.set_option('expand_frame_repr', False);
 ############################# CELL ######################################################################################
 
 DATA_PATH = "data"
-BASE_MODEL = "huggingface_local/codebert-base" #"microsoft/codebert-base"
+#BASE_MODEL = "huggingface_local/codebert-base"
+BASE_MODEL = "microsoft/codebert-base"
 N_SPLITS = 5
 SEQ_LEN = 256
 RANDOM_STATE = 42
 NO_EPOCHS = 100
-
-try:
-    TPU = tf.distribute.cluster_resolver.TPUClusterResolver()
-    tf.config.experimental_connect_to_cluster(TPU)
-    tf.tpu.experimental.initialize_tpu_system(TPU)
-    STRATEGY = tf.distribute.experimental.TPUStrategy(TPU)
-    BATCH_SIZE = 128 * STRATEGY.num_replicas_in_sync
-except Exception:
-    TPU = None
-    #STRATEGY = tf.distribute.get_strategy()
-    gpus = tf.config.list_logical_devices('GPU')
-    strategy = tf.distribute.MirroredStrategy(gpus)
-    BATCH_SIZE = 64
-    NB_LIMIT = 10000
-
-print("TensorFlow", tf.__version__)
-
-if TPU is not None:
-    print("Using TPU v3-8")
-else:
-    print("Using GPU/CPU")
 
 ###################################### CELL #####################################################################################
 def read_notebook(path):
@@ -103,8 +83,8 @@ def pair_up_plus_label(df, mode='train', drop_rate=0.9):
     return triplets
 
 
-def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, np.array]:
-    triplets = pair_up_plus_label(df)
+def tokenize_and_label(df: pd.DataFrame, source_dict: dict, mode:str ) -> Tuple[np.array, np.array]:
+    triplets = pair_up_plus_label(df, mode=mode)
 
     tokenizer = transformers.RobertaTokenizer.from_pretrained(BASE_MODEL, do_lower_case=True )
 
@@ -114,7 +94,6 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, n
     labels = np.zeros((len(triplets)), dtype='int32')
 
     for i, x in enumerate(tqdm(triplets, total=len(triplets))):
-        label = x[2]
         markdown_source = source_dict[ x[0]]
         code_source = source_dict[ x[1] ]
         tokens_md = tokenizer.tokenize( markdown_source )[:SEQ_LEN]
@@ -146,7 +125,7 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, n
         input_ids[i] = input
         attention_mask[i] = a_mask
         segment_ids[i] = seg_ids
-        labels[i] = label
+        labels[i] = x[2]
 
 
     return input_ids, attention_mask, segment_ids, labels
@@ -238,35 +217,53 @@ def kendall_tau(ground_truth, predictions):
 
 
 #################################### CELL inference ######################################################################
-paths = glob.glob(os.path.join(DATA_PATH, "test", "*.json"))
+paths = glob.glob(os.path.join(DATA_PATH, "val", "*.json"))
 
 test_df = pd.concat([read_notebook(x) for x in tqdm(paths, total=len(paths))])
-test_df = test_df.rename_axis("cell_id").reset_index()
+#test_df = test_df.rename_axis("cell_id").reset_index()
+
+df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
+
+df_orders_ = df_orders.to_frame().join(  test_df.reset_index('cell_id').groupby('id')['cell_id'].apply(list), how='right')
+
+ranks = {}
+for id_, cell_order, cell_id in df_orders_.itertuples():
+    ranks[id_] = {'cell_id': cell_id, 'rank': get_ranks(cell_order, cell_id)}
+
+df_ranks = (
+    pd.DataFrame
+    .from_dict(ranks, orient='index')
+    .rename_axis('id')
+    .apply(pd.Series.explode)
+    .set_index('cell_id', append=True)
+)
+val_df = test_df.reset_index().merge(df_ranks, on=["id", "cell_id"])#.merge(df_ancestors, on=["id"])
 
 test_df["rank"] = test_df.groupby(["id", "cell_type"]).cumcount()
-test_df["pct_rank"] = test_df.groupby(["id", "cell_type"])["rank"].rank(pct=True)
+test_df["pred"] = test_df.groupby(["id", "cell_type"])["rank"].rank(pct=False)
+#val_df["pct_rank"] = val_df.groupby(["id", "cell_type"])["rank"].rank(pct=True)
 
-display(test_df)
+display(val_df)
 
-input_ids, attention_mask, segment_ids, labels = tokenize_and_label(test_df, dict(zip(test_df['cell_id'].values, test_df['source'].values)))
-test_dataset = get_dataset(
-    input_ids=input_ids,
-    attention_mask=attention_mask,
-    segment_ids = segment_ids,
-    ordered=True,
-)
-model = get_model()
-model.load_weights("model_0.h5")
-y_pred = model.predict(test_dataset)
+input_ids, attention_mask, segment_ids, labels = tokenize_and_label(val_df, dict(zip(val_df['cell_id'].values, val_df['source'].values)), mode='test')
+# val_dataset = get_dataset(
+#     input_ids=input_ids,
+#     attention_mask=attention_mask,
+#     segment_ids = segment_ids,
+#     ordered=True,
+# )
+#model = get_model()
+#model.load_weights("model_0.h5")
+#y_pred = model.predict(val_dataset)
 
-preds_copy = y_pred
+preds_copy = labels #y_pred
 
 pred_vals = []
 count = 0
 for id, df_tmp in tqdm(test_df.groupby('id')):
   df_tmp_mark = df_tmp[df_tmp['cell_type']=='markdown']
   df_tmp_code = df_tmp[df_tmp['cell_type']!='markdown']
-  df_tmp_code_rank = df_tmp_code['rank'].rank().values
+  df_tmp_code_rank = df_tmp_code['pred'].values
   N_code = len(df_tmp_code_rank)
   N_mark = len(df_tmp_mark)
 
@@ -277,22 +274,17 @@ for id, df_tmp in tqdm(test_df.groupby('id')):
   for i in range(N_mark):
     pred = preds_tmp[i*N_code:i*N_code+N_code]
 
-    softmax = np.exp((pred-np.mean(pred)) *20)/np.sum(np.exp((pred-np.mean(pred)) *20))
+    #softmax = np.exp((pred-np.mean(pred)) *20)/np.sum(np.exp((pred-np.mean(pred)) *20))
 
-    rank = np.sum(softmax * df_tmp_code_rank)
+    #rank = np.sum(softmax * df_tmp_code_rank) - 0.5
+    rank = df_tmp_code_rank[ np.argmax( pred)] - 0.5
     pred_vals.append(rank)
 
 ######################################### calculate Kendal_tau ##########################################################
 test_df.loc[test_df["cell_type"] == "markdown", "pred"] = pred_vals
 
-df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
+#df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
 
-y_dummy = test_df.sort_values("pred").groupby('id')['cell_id'].apply(list)
-kendall_tau(df_orders.loc[y_dummy.index], y_dummy)
-
-################################### SUBMIT CELL ###########################################################################
-test_df.loc[test_df["cell_type"] == "markdown", "pct_rank"] = y_pred
-df = test_df.sort_values("pct_rank").groupby("id", as_index=False)["cell_id"].apply(lambda x: " ".join(x))
-df.rename(columns={"cell_id": "cell_order"}, inplace=True)
-df.to_csv("submission.csv", index=False)
-display(df)
+y_dummy = test_df.reset_index().sort_values("pred").groupby('id')['cell_id'].apply(list)
+k = kendall_tau(df_orders.loc[y_dummy.index], y_dummy)
+print(f"kendall_tau = {k}")
