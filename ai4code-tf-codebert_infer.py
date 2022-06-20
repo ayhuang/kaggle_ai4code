@@ -286,7 +286,6 @@ input_ids, attention_mask, segment_ids, labels = tokenize_and_label(val_df, dict
 
 preds_copy = labels #y_pred
 
-pred_vals = []
 count = 0
 for id, df_tmp in tqdm(test_df.groupby('id')):
     df_tmp_md = df_tmp[df_tmp['cell_type']=='markdown']
@@ -300,12 +299,9 @@ for id, df_tmp in tqdm(test_df.groupby('id')):
 
     count += no_md * no_cell
     new_order = sort_with_pairwise_rank(orig_order, preds_tmp )
-    pred_vals.extend( new_order )
+    test_df.loc[test_df['id'] == id, 'pred'] = new_order
 
 ######################################### calculate Kendal_tau ##########################################################
-#test_df.loc[test_df["cell_type"] == "markdown", "pred"] = pred_vals
-test_df['pred'] = pred_vals
-
 y_dummy = test_df.reset_index().sort_values('pred').groupby('id')['cell_id'].apply(list)
 k = kendall_tau(df_orders.loc[y_dummy.index], y_dummy)
 print(f"kendall_tau = {k}")
