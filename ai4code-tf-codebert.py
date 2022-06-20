@@ -38,7 +38,7 @@ except Exception:
     gpus = tf.config.list_logical_devices('GPU')
     strategy = tf.distribute.MirroredStrategy(gpus)
     BATCH_SIZE = 128
-    NB_LIMIT = 10000
+    NB_LIMIT = 10
 
 print("TensorFlow", tf.__version__)
 
@@ -77,25 +77,22 @@ def truncate_seq_pair(tokens_a, tokens_b, max_length):
         else:
             tokens_b.pop()
 
-
-def pair_up_plus_label(df, mode='train', drop_rate=0.9):
+def pair_up_with_label(df, mode='train', drop_rate=0.9):
     triplets = []
-    #ids = df.id.unique()
     random_drop = np.random.random(size=10000) > drop_rate
     count = 0
 
     # for each notebook
     for id, df_tmp in tqdm(df.groupby('id')):
         df_tmp_md = df_tmp[df_tmp['cell_type'] == 'markdown']
-        df_tmp_code = df_tmp[df_tmp['cell_type'] == 'code']
-        df_tmp_code_rank = df_tmp_code['rank'].values
-        df_tmp_code_cid = df_tmp_code['cell_id'].values
+        df_tmp_rank = df_tmp['rank'].values
+        df_tmp_cid = df_tmp['cell_id'].values
 
         for md_cid, rank in df_tmp_md[['cell_id', 'rank']].values:
-            # if the code is right after the markdown cell 1, otherwise 0
-            labels = np.array([(r == (rank + 1)) for r in df_tmp_code_rank]).astype('int')
+            # if the cell is right after this markdown cell 1, otherwise 0
+            labels = np.array([(r == (rank + 1)) for r in df_tmp_rank]).astype('int')
 
-            for cd_cid, label in zip(df_tmp_code_cid, labels):
+            for cd_cid, label in zip(df_tmp_cid, labels):
                 count += 1
                 if label == 1 or mode=='test' or random_drop[count % 10000]:
                     triplets.append([md_cid, cd_cid, label])
@@ -103,8 +100,14 @@ def pair_up_plus_label(df, mode='train', drop_rate=0.9):
     return triplets
 
 
-def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, np.array]:
-    triplets = pair_up_plus_label(df)
+def cleanup_text(string):
+    for char in ['\r\n', '\r', '\n']:
+        string = string.replace(char, ' ')
+    return string
+
+
+def tokenize_and_label(df: pd.DataFrame, source_dict: dict, mode:str ) -> Tuple[np.array, np.array]:
+    triplets = pair_up_with_label(df, mode=mode)
 
     tokenizer = transformers.RobertaTokenizer.from_pretrained(BASE_MODEL, do_lower_case=True )
 
@@ -114,9 +117,8 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, n
     labels = np.zeros((len(triplets)), dtype='int32')
 
     for i, x in enumerate(tqdm(triplets, total=len(triplets))):
-        label = x[2]
-        markdown_source = source_dict[ x[0]]
-        code_source = source_dict[ x[1] ]
+        markdown_source = cleanup_text( source_dict[ x[0]] )
+        code_source = cleanup_text(source_dict[ x[1] ])
         tokens_md = tokenizer.tokenize( markdown_source )[:SEQ_LEN]
         tokens_cd = tokenizer.tokenize( code_source )[:SEQ_LEN]
 
@@ -134,22 +136,14 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict) -> Tuple[np.array, n
         input +=  ([0] * padding_length)
         a_mask +=  ([0] * padding_length)
         seg_ids += ([0] * padding_length)
-        # encoding = tokenizer.encode_plus(
-        #     x,
-        #     None,
-        #     add_special_tokens=True,
-        #     max_length=SEQ_LEN,
-        #     padding="max_length",
-        #     return_token_type_ids=True,
-        #     truncation=True,
-        # )
         input_ids[i] = input
         attention_mask[i] = a_mask
         segment_ids[i] = seg_ids
-        labels[i] = label
+        labels[i] = x[2]
 
 
     return input_ids, attention_mask, segment_ids, labels
+
 
 #################################################################################
 def get_dataset(
@@ -225,9 +219,8 @@ df =  pd.concat(notebooks_train).set_index('id', append=True).swaplevel().sort_i
 
 df_orders = pd.read_csv(os.path.join(DATA_PATH, "train_orders.csv"),   index_col='id').squeeze("columns").str.split()  # Split the string representation of cell_ids into a list
 
-df_orders_ = df_orders.to_frame().join(   df.reset_index('cell_id').groupby('id')['cell_id'].apply(list),
-    how='right',
-)
+df_orders_ = df_orders.to_frame().join(  df.reset_index('cell_id').groupby('id')['cell_id'].apply(list),
+                                            how='right')
 
 ranks = {}
 for id_, cell_order, cell_id in df_orders_.itertuples():
@@ -254,7 +247,7 @@ display(df)
 dict_cellid_source = dict(zip(df['cell_id'].values, df['source'].values))
 
 ##################################### CELL ##############################################################################
-input_ids, attention_mask, segment_ids, labels = tokenize_and_label(df, dict_cellid_source)
+input_ids, attention_mask, segment_ids, labels = tokenize_and_label(df, dict_cellid_source, 'train')
 
 #groups = df["ancestor_id"].to_numpy()
 

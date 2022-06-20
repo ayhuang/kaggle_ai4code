@@ -81,6 +81,12 @@ def pair_up_with_label(df, mode='train', drop_rate=0.9):
     return triplets
 
 
+def cleanup_text(string):
+    for char in ['\r\n', '\r', '\n']:
+        string = string.replace(char, ' ')
+    return string
+
+
 def tokenize_and_label(df: pd.DataFrame, source_dict: dict, mode:str ) -> Tuple[np.array, np.array]:
     triplets = pair_up_with_label(df, mode=mode)
 
@@ -92,8 +98,8 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict, mode:str ) -> Tuple[
     labels = np.zeros((len(triplets)), dtype='int32')
 
     for i, x in enumerate(tqdm(triplets, total=len(triplets))):
-        markdown_source = source_dict[ x[0]]
-        code_source = source_dict[ x[1] ]
+        markdown_source = cleanup_text( source_dict[ x[0]] )
+        code_source = cleanup_text(source_dict[ x[1] ])
         tokens_md = tokenizer.tokenize( markdown_source )[:SEQ_LEN]
         tokens_cd = tokenizer.tokenize( code_source )[:SEQ_LEN]
 
@@ -111,15 +117,6 @@ def tokenize_and_label(df: pd.DataFrame, source_dict: dict, mode:str ) -> Tuple[
         input +=  ([0] * padding_length)
         a_mask +=  ([0] * padding_length)
         seg_ids += ([0] * padding_length)
-        # encoding = tokenizer.encode_plus(
-        #     x,
-        #     None,
-        #     add_special_tokens=True,
-        #     max_length=SEQ_LEN,
-        #     padding="max_length",
-        #     return_token_type_ids=True,
-        #     truncation=True,
-        # )
         input_ids[i] = input
         attention_mask[i] = a_mask
         segment_ids[i] = seg_ids
