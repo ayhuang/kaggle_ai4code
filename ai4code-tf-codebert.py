@@ -38,7 +38,7 @@ except Exception:
     gpus = tf.config.list_logical_devices('GPU')
     strategy = tf.distribute.MirroredStrategy(gpus)
     BATCH_SIZE = 128
-    NB_LIMIT = 10
+    NB_LIMIT = 10000
 
 print("TensorFlow", tf.__version__)
 
