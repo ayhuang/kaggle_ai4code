@@ -193,6 +193,22 @@ class DataSetGenerator:
 
 
 
+ class CodeBERTModel(tf.keras.Model):
+    def __init__(self, base_model):
+      super(CodeBERTModel, self).__init__(name="prediction")
+      self.base_encoder = transformers.TFRobertaModel.from_pretrained(base_model)
+      self.dropout = tf.keras.layers.Dropout(0.1)
+      self.dense = tf.keras.layers.Dense(1, activation="linear", dtype="float32")
+
+    def call(self, inputs):
+      base_encoder_inputs = { "input_ids": inputs[0], "attention_mask": inputs[1], "token_type_ids": inputs[2]}
+      encoder_outputs = self.encoder( base_encoder_inputs )
+      pooled_output = encoder_outputs[1] # is the pooled output from transformers BERT output
+      x = self.dropout(pooled_output)
+      x = self.dense(x)
+      return x
+
+
 def get_model() -> tf.keras.Model:
     backbone = transformers.TFRobertaModel.from_pretrained(BASE_MODEL)
     input_ids = tf.keras.layers.Input(
@@ -228,6 +244,7 @@ def get_model() -> tf.keras.Model:
         loss=tf.keras.losses.MeanSquaredError(),
     )
     return model
+
 ###################################### CELL #####################################################################################
 from bisect import bisect
 
