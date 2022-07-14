@@ -2,7 +2,7 @@ import glob
 import json
 import os
 from typing import Optional, Tuple
-
+import random
 import numpy as np
 import pandas as pd
 import tensorflow as tf
@@ -24,7 +24,7 @@ BASE_MODEL = "huggingface_local/codebert-base" #"microsoft/codebert-base"
 N_SPLITS = 5
 SEQ_LEN = 128
 RANDOM_STATE = 42
-NO_EPOCHS = 20
+NO_EPOCHS = 30
 
 try:
     TPU = tf.distribute.cluster_resolver.TPUClusterResolver()
@@ -172,7 +172,7 @@ def get_dataset(
     return dataset
 
 
-def get_model() -> tf.keras.Model:
+def get_model() :
     backbone = transformers.TFRobertaModel.from_pretrained(BASE_MODEL)
     input_ids = tf.keras.layers.Input(
         shape=(SEQ_LEN,),
@@ -189,14 +189,15 @@ def get_model() -> tf.keras.Model:
         dtype=tf.int32,
         name="token_type_ids",
     )
-    x = backbone(
+    base_output = backbone(
         {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "token_type_ids": input_type_ids
         },
     )
-    outputs = tf.keras.layers.Dense(1, activation="linear", dtype="float32")(x[0][:, 0, :])
+    x = tf.keras.layers.Dropout(0.1)(base_output[1])
+    outputs = tf.keras.layers.Dense(1, activation=None, dtype="float32")(x)#(x[0][:, 0, :])
 
     model = tf.keras.Model(
         inputs=[input_ids, attention_mask, input_type_ids],
@@ -204,14 +205,15 @@ def get_model() -> tf.keras.Model:
     )
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=5e-5),
-        loss=tf.keras.losses.MeanSquaredError(),
+        loss=tf.keras.losses.BinaryCrossentropy(from_logits=True),
+        metrics = tf.metrics.BinaryAccuracy()
     )
     return model
 ###################################### CELL #####################################################################################
 
 paths = glob.glob(os.path.join(DATA_PATH, "train", "*.json"))
 if NB_LIMIT is not None:
-    paths = paths[:NB_LIMIT]
+    paths = list( paths[i] for i in random.sample(range(len(paths)), NB_LIMIT))
 
 notebooks_train = [ read_notebook(path) for path in tqdm(paths, desc='Train NBs')]
 

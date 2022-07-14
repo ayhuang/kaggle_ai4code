@@ -210,33 +210,71 @@ def kendall_tau(ground_truth, predictions):
         total_2max += n * (n - 1)
     return 1 - 4 * total_inversions / total_2max
 
+
+def chain_blocks( block, t, cells_to_sort, buddies, blocks, head_index):
+    if t in blocks.keys():
+        block.extend( blocks[t])
+        blocks.pop(t, None)
+    elif t in cells_to_sort:
+        t1 = buddies[t]
+        block.append( t1 )
+        if t > head_index:
+            cells_to_sort.remove(t) # remove the list to avoid duplicate
+        blocks.pop(t, None)
+        chain_blocks( block, t1, cells_to_sort, buddies, blocks, head_index)
+
+    return
+
 # this will sort an array based on relative pair wise order
 # assuming only the bottom portion of the original list needs to be sorted
-# the relative rank is given as one-hot-index of the after index, i.e  1 means the index is after the index being sorted 0, means otherwise
+# the relative rank is given as one-hot-index of the after index, i.e  1 means the index is after the index being sorted 0 means otherwise
 def sort_with_pairwise_rank( orig_order, relative_rank):
     no_elements = len(orig_order)
-
     no_to_sort = int(len( relative_rank)/no_elements)
+
     fix_elements = no_elements - no_to_sort
-    new_order = np.copy(orig_order)
-    buddy_lst = [[]]*no_to_sort
+    cells_to_sort = [i for i in range(fix_elements, no_elements)]
+
+    trailling_buddy= [None]*no_elements
+    # initialize the fixed elements, if one of these is found to be a buddy, then it will be removed.
+    blocks = dict((x,[x]) for x in range(0, fix_elements))
+    #try to pair up the cells
+    min_sum = 1000.0
+    last_cell = -1
     for i in range(no_to_sort):
         tmp_rel_rank = relative_rank[i * no_elements:(i + 1) * no_elements]
-        i_plus_1 = np.argmax(tmp_rel_rank)
-        # move i before i_plus_1, note i itself may be moved later on
-        #new_order[ i + fix_elements] = new_order[i_plus_1] -0.5*0.9**i
-        buddy_lst[i] = [i_plus_1]
+        # it is possible a markdown cell may be the last cell in the NB, it then will not have a trailing budding
+        # however, there doesn't seem to be a deterministic way to find that out. So we will just have to make some
+        # arbitrary assumption here.
+        sum_0 = np.linalg.norm(tmp_rel_rank)
+        buddy = np.argmax(tmp_rel_rank)
+        trailling_buddy[i + fix_elements] = buddy
+        if buddy < fix_elements and sum_0 > 1.0e-9:
+            blocks.pop(buddy, None)
 
-    # need to take care of overlapping in buddy list, i.e., we have [12,17] and [17,10]
-    for k, lst_1 in enumerate(buddy_lst):
-        for lst in buddy_lst:
-            if k+fix_elements in lst:
-                lst.extend(lst_1)
+        if sum_0 < min_sum:
+            min_sum = sum_0
+            last_cell = i+fix_elements
 
-    for index, lst in enumerate( buddy_lst):
-        new_order[index + fix_elements ] = min(lst) + 0.5 * 0.9**(len(lst))
+    if last_cell > 0 and min_sum < 0.4:
+        trailling_buddy[last_cell] = 5000; # cell without a buddy, must be the last cell.
 
-    return  new_order
+
+    # combine to form contigious blocks  i.e., we  may have 12->[17] and 17->[10], in which case,
+    # [12,17,10] forms a single block
+    for k in cells_to_sort:
+        t= trailling_buddy[k]
+        block=[k, t]
+        chain_blocks( block, t, cells_to_sort, trailling_buddy, blocks, k)
+        blocks[k] = block
+
+    #blocks may be like [[4,7,11,10],[5,3],[6,1],[8,9,2]]
+    lst = list(blocks.values())
+    lst.sort( key=lambda x:x[-1])
+    #flatten the blocks into a list
+    new_order =  [x for block in lst for x in block]
+    return [new_order.index(x) for x in range(no_elements)]
+
 
 
 
@@ -285,6 +323,7 @@ preds_copy = labels #y_pred
 
 count = 0
 for id, df_tmp in tqdm(test_df.groupby('id')):
+    print( f'processing {id}')
     df_tmp_md = df_tmp[df_tmp['cell_type']=='markdown']
 
      #original order of all cells, markdown and code in a NB
